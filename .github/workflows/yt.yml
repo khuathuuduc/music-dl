@@ -13,6 +13,7 @@ on:
 jobs:
   download:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
@@ -32,27 +33,73 @@ jobs:
 
       - name: Install yt-dlp and ffmpeg
         run: |
-          pip install --quiet yt-dlp
+          pip install --quiet --upgrade yt-dlp
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
 
+      - name: Decode cookies
+        id: cookies
+        run: |
+          if [ -n "${{ secrets.YT_COOKIES }}" ]; then
+            echo "${{ secrets.YT_COOKIES }}" | base64 -d > cookies.txt
+            echo "✅ Cookies file: $(wc -l < cookies.txt) lines"
+            echo "has_cookies=true" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ No YT_COOKIES secret — trying without cookies"
+            echo "has_cookies=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Download MP3
         run: |
+          URL="${{ steps.url.outputs.url }}"
+          ID="${{ steps.url.outputs.id }}"
+          OUT="%(title).150B_${ID}.%(ext)s"
+
+          COOKIE_OPT=""
+          [ -f cookies.txt ] && COOKIE_OPT="--cookies cookies.txt"
+
+          echo "=== Strategy 1: web_safari + cookies ==="
           yt-dlp \
-            --no-playlist \
-            --extract-audio \
-            --audio-format mp3 \
-            --audio-quality 192K \
-            --output "%(title).150B_${{ steps.url.outputs.id }}.%(ext)s" \
+            --no-playlist --no-warnings \
+            $COOKIE_OPT \
+            --extractor-args "youtube:player_client=web_safari,web,tv_embedded" \
+            --extract-audio --audio-format mp3 --audio-quality 192K \
+            --output "$OUT" \
             --print-to-file "%(title)s" info.txt \
-            "${{ steps.url.outputs.url }}"
-          echo "=== Files ==="
-          ls -la *.mp3
+            "$URL" && exit 0
+
+          echo "=== Strategy 2: android + cookies ==="
+          yt-dlp \
+            --no-playlist --no-warnings \
+            $COOKIE_OPT \
+            --extractor-args "youtube:player_client=android,ios" \
+            --extract-audio --audio-format mp3 --audio-quality 192K \
+            --output "$OUT" \
+            --print-to-file "%(title)s" info.txt \
+            "$URL" && exit 0
+
+          echo "=== Strategy 3: default ==="
+          yt-dlp \
+            --no-playlist --no-warnings \
+            $COOKIE_OPT \
+            --extract-audio --audio-format mp3 --audio-quality 192K \
+            --output "$OUT" \
+            --print-to-file "%(title)s" info.txt \
+            "$URL"
+
+      - name: Check result
+        run: |
+          ls -la *.mp3 2>/dev/null
+          if ! ls *.mp3 1>/dev/null 2>&1; then
+            echo "::error::Không tải được MP3"
+            exit 1
+          fi
 
       - name: Read title
         id: title
         run: |
-          TITLE=$(cat info.txt | head -1 | tr -d '\n')
+          TITLE=$(cat info.txt 2>/dev/null | head -1 | tr -d '\n')
+          [ -z "$TITLE" ] && TITLE="YouTube ${{ steps.url.outputs.id }}"
           echo "title=$TITLE" >> $GITHUB_OUTPUT
 
       - name: Create Release
@@ -63,7 +110,6 @@ jobs:
           body: |
             Video ID: ${{ steps.url.outputs.id }}
             Title: ${{ steps.title.outputs.title }}
-            Run: ${{ github.run_id }}
           files: "*.mp3"
           draft: false
           prerelease: false
