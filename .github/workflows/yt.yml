@@ -31,7 +31,19 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install tools
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Deno (JS runtime cho yt-dlp)
+        run: |
+          curl -fsSL https://deno.land/install.sh | sh -s -- -y
+          echo "$HOME/.deno/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.deno/bin:$PATH"
+          deno --version
+
+      - name: Install yt-dlp + ffmpeg
         run: |
           pip install --quiet --upgrade yt-dlp
           sudo apt-get update -qq
@@ -44,53 +56,65 @@ jobs:
             echo "Cookies: $(wc -l < cookies.txt) lines"
           fi
 
+      - name: Verify yt-dlp with Deno
+        run: |
+          export PATH="$HOME/.deno/bin:$PATH"
+          yt-dlp --version
+          yt-dlp --js-runtimes deno --list-extractors 2>&1 | head -5 || true
+
       - name: Download audio
         run: |
+          export PATH="$HOME/.deno/bin:$PATH"
           URL="${{ steps.url.outputs.url }}"
           ID="${{ steps.url.outputs.id }}"
           OUT="%(title).150B_${ID}.%(ext)s"
           COOKIE_OPT=""
           [ -f cookies.txt ] && COOKIE_OPT="--cookies cookies.txt"
 
-          # Strategy 1: web + m4a direct (không cần convert)
-          echo "=== Strategy 1: web + m4a direct ==="
+          # === Strategy 1: default client + Deno + cookies ===
+          echo "=== Strategy 1: default + deno + cookies ==="
           yt-dlp \
             --no-playlist --no-warnings \
             $COOKIE_OPT \
-            --extractor-args "youtube:player_client=web,tv_embedded" \
-            -f "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best" \
-            --output "$OUT" \
-            --print-to-file "%(title)s" info.txt \
-            "$URL" && exit 0
-
-          # Strategy 2: android_embedded
-          echo "=== Strategy 2: android_embedded ==="
-          yt-dlp \
-            --no-playlist --no-warnings \
-            $COOKIE_OPT \
-            --extractor-args "youtube:player_client=android_embedded,android" \
-            -f "bestaudio[ext=m4a]/bestaudio" \
-            --output "$OUT" \
-            --print-to-file "%(title)s" info.txt \
-            "$URL" && exit 0
-
-          # Strategy 3: ios + m4a only
-          echo "=== Strategy 3: ios + m4a ==="
-          yt-dlp \
-            --no-playlist --no-warnings \
-            $COOKIE_OPT \
-            --extractor-args "youtube:player_client=ios,web_safari" \
-            -f "bestaudio[ext=m4a]/bestaudio" \
-            --output "$OUT" \
-            --print-to-file "%(title)s" info.txt \
-            "$URL" && exit 0
-
-          # Strategy 4: Cuối cùng — dùng extract-audio
-          echo "=== Strategy 4: extract-audio mp3 ==="
-          yt-dlp \
-            --no-playlist --no-warnings \
-            $COOKIE_OPT \
+            --js-runtimes deno \
+            --extractor-args "youtube:player_client=default,-tv,web_safari" \
+            -f "bestaudio/best" \
             -x --audio-format mp3 --audio-quality 192K \
+            --output "$OUT" \
+            --print-to-file "%(title)s" info.txt \
+            "$URL" && exit 0
+
+          # === Strategy 2: web + deno ===
+          echo "=== Strategy 2: web + deno ==="
+          yt-dlp \
+            --no-playlist --no-warnings \
+            $COOKIE_OPT \
+            --js-runtimes deno \
+            --extractor-args "youtube:player_client=web,mweb" \
+            -f "bestaudio[ext=m4a]/bestaudio" \
+            --output "$OUT" \
+            --print-to-file "%(title)s" info.txt \
+            "$URL" && exit 0
+
+          # === Strategy 3: tv_embedded + deno ===
+          echo "=== Strategy 3: tv_embedded + deno ==="
+          yt-dlp \
+            --no-playlist --no-warnings \
+            $COOKIE_OPT \
+            --js-runtimes deno \
+            --extractor-args "youtube:player_client=tv_embedded,web_embedded,tv" \
+            -f "bestaudio[ext=m4a]/bestaudio/best" \
+            --output "$OUT" \
+            --print-to-file "%(title)s" info.txt \
+            "$URL" && exit 0
+
+          # === Strategy 4: android_vr (không cần cipher) ===
+          echo "=== Strategy 4: android_vr ==="
+          yt-dlp \
+            --no-playlist --no-warnings \
+            $COOKIE_OPT \
+            --js-runtimes deno \
+            --extractor-args "youtube:player_client=android_vr,android_testsuite" \
             -f "bestaudio/best" \
             --output "$OUT" \
             --print-to-file "%(title)s" info.txt \
@@ -98,7 +122,6 @@ jobs:
 
       - name: Convert to MP3 if needed
         run: |
-          # Nếu file là m4a/webm/opus → convert sang mp3
           for f in *.m4a *.webm *.opus *.ogg; do
             [ -f "$f" ] || continue
             base="${f%.*}"
@@ -106,11 +129,11 @@ jobs:
             ffmpeg -i "$f" -vn -acodec libmp3lame -ab 192k -y "$base.mp3"
             rm -f "$f"
           done
-          ls -la *.mp3 2>/dev/null || ls -la
+          ls -la
 
       - name: Check result
         run: |
-          ls -la
+          ls -la *.mp3 2>/dev/null
           if ! ls *.mp3 1>/dev/null 2>&1; then
             echo "::error::Không tải được MP3"
             exit 1
