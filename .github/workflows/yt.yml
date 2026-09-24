@@ -22,7 +22,7 @@ jobs:
         run: |
           URL="${{ github.event.inputs.video_url || github.event.client_payload.video_url }}"
           echo "url=$URL" >> $GITHUB_OUTPUT
-          ID=$(echo "$URL" | grep -oE '(v=|youtu\.be/|shorts/)[a-zA-Z0-9_-]{11}' | head -1 | grep -oE '[a-zA-Z0-9_-]{11}')
+          ID=$(echo "$URL" | grep -oE '(v=|youtu\.be/|shorts/|embed/)[a-zA-Z0-9_-]{11}' | head -1 | grep -oE '[a-zA-Z0-9_-]{11}')
           echo "id=$ID" >> $GITHUB_OUTPUT
           echo "Video ID: $ID"
 
@@ -31,65 +31,86 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install yt-dlp and ffmpeg
+      - name: Install tools
         run: |
           pip install --quiet --upgrade yt-dlp
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
 
       - name: Decode cookies
-        id: cookies
         run: |
           if [ -n "${{ secrets.YT_COOKIES }}" ]; then
             echo "${{ secrets.YT_COOKIES }}" | base64 -d > cookies.txt
-            echo "✅ Cookies file: $(wc -l < cookies.txt) lines"
-            echo "has_cookies=true" >> $GITHUB_OUTPUT
-          else
-            echo "⚠️ No YT_COOKIES secret — trying without cookies"
-            echo "has_cookies=false" >> $GITHUB_OUTPUT
+            echo "Cookies: $(wc -l < cookies.txt) lines"
           fi
 
-      - name: Download MP3
+      - name: Download audio
         run: |
           URL="${{ steps.url.outputs.url }}"
           ID="${{ steps.url.outputs.id }}"
           OUT="%(title).150B_${ID}.%(ext)s"
-
           COOKIE_OPT=""
           [ -f cookies.txt ] && COOKIE_OPT="--cookies cookies.txt"
 
-          echo "=== Strategy 1: web_safari + cookies ==="
+          # Strategy 1: web + m4a direct (không cần convert)
+          echo "=== Strategy 1: web + m4a direct ==="
           yt-dlp \
             --no-playlist --no-warnings \
             $COOKIE_OPT \
-            --extractor-args "youtube:player_client=web_safari,web,tv_embedded" \
-            --extract-audio --audio-format mp3 --audio-quality 192K \
+            --extractor-args "youtube:player_client=web,tv_embedded" \
+            -f "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best" \
             --output "$OUT" \
             --print-to-file "%(title)s" info.txt \
             "$URL" && exit 0
 
-          echo "=== Strategy 2: android + cookies ==="
+          # Strategy 2: android_embedded
+          echo "=== Strategy 2: android_embedded ==="
           yt-dlp \
             --no-playlist --no-warnings \
             $COOKIE_OPT \
-            --extractor-args "youtube:player_client=android,ios" \
-            --extract-audio --audio-format mp3 --audio-quality 192K \
+            --extractor-args "youtube:player_client=android_embedded,android" \
+            -f "bestaudio[ext=m4a]/bestaudio" \
             --output "$OUT" \
             --print-to-file "%(title)s" info.txt \
             "$URL" && exit 0
 
-          echo "=== Strategy 3: default ==="
+          # Strategy 3: ios + m4a only
+          echo "=== Strategy 3: ios + m4a ==="
           yt-dlp \
             --no-playlist --no-warnings \
             $COOKIE_OPT \
-            --extract-audio --audio-format mp3 --audio-quality 192K \
+            --extractor-args "youtube:player_client=ios,web_safari" \
+            -f "bestaudio[ext=m4a]/bestaudio" \
+            --output "$OUT" \
+            --print-to-file "%(title)s" info.txt \
+            "$URL" && exit 0
+
+          # Strategy 4: Cuối cùng — dùng extract-audio
+          echo "=== Strategy 4: extract-audio mp3 ==="
+          yt-dlp \
+            --no-playlist --no-warnings \
+            $COOKIE_OPT \
+            -x --audio-format mp3 --audio-quality 192K \
+            -f "bestaudio/best" \
             --output "$OUT" \
             --print-to-file "%(title)s" info.txt \
             "$URL"
 
+      - name: Convert to MP3 if needed
+        run: |
+          # Nếu file là m4a/webm/opus → convert sang mp3
+          for f in *.m4a *.webm *.opus *.ogg; do
+            [ -f "$f" ] || continue
+            base="${f%.*}"
+            echo "Converting $f → $base.mp3"
+            ffmpeg -i "$f" -vn -acodec libmp3lame -ab 192k -y "$base.mp3"
+            rm -f "$f"
+          done
+          ls -la *.mp3 2>/dev/null || ls -la
+
       - name: Check result
         run: |
-          ls -la *.mp3 2>/dev/null
+          ls -la
           if ! ls *.mp3 1>/dev/null 2>&1; then
             echo "::error::Không tải được MP3"
             exit 1
