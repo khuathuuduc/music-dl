@@ -26,56 +26,89 @@ jobs:
           echo "id=$ID" >> $GITHUB_OUTPUT
           echo "Video ID: $ID"
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Install Deno
+      - name: Setup Python + Deno
         run: |
+          python3 --version
           curl -fsSL https://deno.land/install.sh | sh -s -- -y
           echo "$HOME/.deno/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.deno/bin:$PATH"
+          deno --version
 
-      - name: Install yt-dlp + ffmpeg + POT plugin
+      - name: Install yt-dlp + ffmpeg + POT
         run: |
           pip install --quiet --upgrade yt-dlp
           pip install --quiet bgutil-ytdlp-pot-provider
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
+          echo "yt-dlp: $(yt-dlp --version)"
 
-      - name: Build POT provider server
+      - name: Build POT server
         run: |
           git clone --depth=1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /tmp/bgutil
           cd /tmp/bgutil/server
           npm install --silent --no-audit --no-fund
           npx --yes tsc
           echo "=== Build done ==="
-          ls -la build/ 2>/dev/null | head -5
+          ls -la build/ | head -5
 
-      - name: Start POT provider server
+      - name: Start POT server
         run: |
           cd /tmp/bgutil/server
           nohup node build/main.js > /tmp/pot.log 2>&1 &
-          echo "POT server PID: $!"
-          sleep 5
+          echo "PID: $!"
+          sleep 8
           echo "=== POT log ==="
           cat /tmp/pot.log
-          echo "=== Ping test ==="
-          curl -s -m 10 http://127.0.0.1:4416/ping || echo "ping failed"
+          echo "=== Ping ==="
+          curl -s -m 10 "http://127.0.0.1:4416/ping" && echo "" || echo "ping failed"
 
       - name: Decode cookies
         run: |
           if [ -n "${{ secrets.YT_COOKIES }}" ]; then
             echo "${{ secrets.YT_COOKIES }}" | base64 -d > cookies.txt
             echo "Cookies: $(wc -l < cookies.txt) lines"
+            head -3 cookies.txt
+          else
+            echo "No cookies secret"
           fi
 
-      - name: Download audio (with POT)
+      - name: Test cookies
+        id: cktest
+        continue-on-error: true
+        run: |
+          export PATH="$HOME/.deno/bin:$PATH"
+          if [ ! -f cookies.txt ]; then
+            echo "skip=1" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "=== Dry run (không tải) ==="
+          yt-dlp --cookies cookies.txt --no-warnings \
+            --simulate --print "%(title)s" \
+            "https://www.youtube.com/watch?v=jNQXAC9IVRw" 2>&1 | tail -10
+          echo "cookie_ok=1" >> $GITHUB_OUTPUT
+
+      - name: List formats (debug)
+        continue-on-error: true
+        run: |
+          export PATH="$HOME/.deno/bin:$PATH"
+          COOKIE_OPT=""
+          [ -f cookies.txt ] && COOKIE_OPT="--cookies cookies.txt"
+          URL="${{ steps.url.outputs.url }}"
+
+          echo "=== List formats (mweb+POT) ==="
+          yt-dlp --no-warnings --list-formats $COOKIE_OPT \
+            --js-runtimes deno \
+            --extractor-args "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416;youtube:player_client=mweb" \
+            "$URL" 2>&1 | head -60
+
+          echo ""
+          echo "=== List formats (web_safari no POT) ==="
+          yt-dlp --no-warnings --list-formats $COOKIE_OPT \
+            --js-runtimes deno \
+            --extractor-args "youtube:player_client=web_safari" \
+            "$URL" 2>&1 | head -60
+
+      - name: Download audio (multi-strategy)
         run: |
           export PATH="$HOME/.deno/bin:$PATH"
           URL="${{ steps.url.outputs.url }}"
@@ -83,64 +116,88 @@ jobs:
           OUT="%(title).150B_${ID}.%(ext)s"
           COOKIE_OPT=""
           [ -f cookies.txt ] && COOKIE_OPT="--cookies cookies.txt"
+          POT="youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416"
 
-          POT_ARG="--extractor-args youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416"
-
-          # === Strategy 1: mweb + POT + cookies ===
-          echo "=== Strategy 1: mweb + POT ==="
-          yt-dlp \
-            --no-playlist --no-warnings \
-            $COOKIE_OPT \
-            --js-runtimes deno \
-            $POT_ARG \
-            --extractor-args "youtube:player_client=mweb,web" \
-            -f "bestaudio/best" \
-            -x --audio-format mp3 --audio-quality 192K \
-            --output "$OUT" \
-            --print-to-file "%(title)s" info.txt \
+          # S1: mweb + POT + bestaudio (gộp extractor-args!)
+          echo ""
+          echo "═══════ S1: mweb + POT + bestaudio ═══════"
+          yt-dlp --no-playlist --no-warnings $COOKIE_OPT --js-runtimes deno \
+            --extractor-args "$POT;youtube:player_client=mweb" \
+            -f "bestaudio/best" -x --audio-format mp3 --audio-quality 192K \
+            --output "$OUT" --print-to-file "%(title)s" info.txt \
             "$URL" && exit 0
 
-          # === Strategy 2: web_safari + POT ===
-          echo "=== Strategy 2: web_safari + POT ==="
-          yt-dlp \
-            --no-playlist --no-warnings \
-            $COOKIE_OPT \
-            --js-runtimes deno \
-            $POT_ARG \
-            --extractor-args "youtube:player_client=web_safari,tv_embedded" \
-            -f "bestaudio[ext=m4a]/bestaudio" \
-            --output "$OUT" \
-            --print-to-file "%(title)s" info.txt \
+          # S2: web_safari + POT
+          echo ""
+          echo "═══════ S2: web_safari + POT ═══════"
+          yt-dlp --no-playlist --no-warnings $COOKIE_OPT --js-runtimes deno \
+            --extractor-args "$POT;youtube:player_client=web_safari" \
+            -f "bestaudio/best" -x --audio-format mp3 --audio-quality 192K \
+            --output "$OUT" --print-to-file "%(title)s" info.txt \
             "$URL" && exit 0
 
-          # === Strategy 3: tv + POT ===
-          echo "=== Strategy 3: tv + POT ==="
-          yt-dlp \
-            --no-playlist --no-warnings \
-            $COOKIE_OPT \
-            --js-runtimes deno \
-            $POT_ARG \
-            --extractor-args "youtube:player_client=tv,tv_embedded" \
-            -f "bestaudio/best" \
-            --output "$OUT" \
-            --print-to-file "%(title)s" info.txt \
+          # S3: tv_embedded (không cần POT)
+          echo ""
+          echo "═══════ S3: tv_embedded ═══════"
+          yt-dlp --no-playlist --no-warnings $COOKIE_OPT --js-runtimes deno \
+            --extractor-args "youtube:player_client=tv_embedded" \
+            -f "bestaudio/best" -x --audio-format mp3 --audio-quality 192K \
+            --output "$OUT" --print-to-file "%(title)s" info.txt \
+            "$URL" && exit 0
+
+          # S4: android_vr
+          echo ""
+          echo "═══════ S4: android_vr ═══════"
+          yt-dlp --no-playlist --no-warnings $COOKIE_OPT --js-runtimes deno \
+            --extractor-args "youtube:player_client=android_vr" \
+            -f "bestaudio/best" -x --audio-format mp3 --audio-quality 192K \
+            --output "$OUT" --print-to-file "%(title)s" info.txt \
+            "$URL" && exit 0
+
+          # S5: format 18 (muxed MP4, luôn có)
+          echo ""
+          echo "═══════ S5: itag 18 muxed ═══════"
+          yt-dlp --no-playlist --no-warnings $COOKIE_OPT --js-runtimes deno \
+            --extractor-args "$POT;youtube:player_client=mweb" \
+            -f "18/b" \
+            --output "$OUT" --print-to-file "%(title)s" info.txt \
+            "$URL" && exit 0
+
+          # S6: ios + POT
+          echo ""
+          echo "═══════ S6: ios + POT ═══════"
+          yt-dlp --no-playlist --no-warnings $COOKIE_OPT --js-runtimes deno \
+            --extractor-args "$POT;youtube:player_client=ios" \
+            -f "bestaudio/best" -x --audio-format mp3 --audio-quality 192K \
+            --output "$OUT" --print-to-file "%(title)s" info.txt \
+            "$URL" && exit 0
+
+          # S7: default no cookies
+          echo ""
+          echo "═══════ S7: default no cookies ═══════"
+          yt-dlp --no-playlist --no-warnings --js-runtimes deno \
+            --extractor-args "youtube:player_client=default" \
+            -f "bestaudio/best" -x --audio-format mp3 --audio-quality 192K \
+            --output "$OUT" --print-to-file "%(title)s" info.txt \
             "$URL"
 
       - name: Convert to MP3
+        if: always()
         run: |
-          for f in *.m4a *.webm *.opus *.ogg; do
+          for f in *.m4a *.webm *.opus *.ogg *.mp4; do
             [ -f "$f" ] || continue
             base="${f%.*}"
-            ffmpeg -i "$f" -vn -acodec libmp3lame -ab 192k -y "$base.mp3"
-            rm -f "$f"
+            echo "Convert: $f → $base.mp3"
+            ffmpeg -i "$f" -vn -acodec libmp3lame -ab 192k -y "$base.mp3" 2>&1 | tail -2
+            [ "$f" != "$base.mp3" ] && rm -f "$f"
           done
-          ls -la
+          echo "=== MP3 files ==="
+          ls -la *.mp3 2>/dev/null || echo "NO MP3"
 
       - name: Check result
         run: |
-          ls -la *.mp3 2>/dev/null || ls -la
           if ! ls *.mp3 1>/dev/null 2>&1; then
-            echo "::error::Không tải được MP3"
+            echo "::error::Không tải được MP3 — xem log các strategy ở trên"
             exit 1
           fi
 
@@ -152,6 +209,7 @@ jobs:
           echo "title=$TITLE" >> $GITHUB_OUTPUT
 
       - name: Create Release
+        if: success()
         uses: softprops/action-gh-release@v2
         with:
           tag_name: yt-${{ steps.url.outputs.id }}-${{ github.run_id }}
